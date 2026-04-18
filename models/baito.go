@@ -49,7 +49,7 @@ type BaitoWorker struct {
 	Location     string    `json:"address" bson:"address"`
 	Preferred    []string  `json:"preferred_roles" bson:"preferred_roles"`
 	Bio          string    `json:"bio" bson:"bio"`
-	ProfilePic   string    `json:"photo" bson:"photo"`
+	Avatar       string    `json:"avatar" bson:"avatar"`
 	Email        string    `json:"email,omitempty" bson:"email,omitempty"`
 	Experience   string    `json:"experience,omitempty" bson:"experience,omitempty"`
 	Skills       string    `json:"skills,omitempty" bson:"skills,omitempty"`

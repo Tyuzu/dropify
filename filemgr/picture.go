@@ -40,7 +40,7 @@ var entityMetaMap = map[string]entityMeta{
 	"place":    {db.PlacesCollection, "placeid", "place:", "createdBy"},
 	"event":    {db.EventsCollection, "eventid", "event:", "creatorid"},
 	"baito":    {db.BaitoCollection, "baitoid", "baito:", "ownerId"},
-	"worker":   {db.BaitoWorkerCollection, "baito_user_id", "worker:", "userid"},
+	"worker":   {db.BaitoWorkerCollection, "baitoUserId", "worker:", "userId"},
 	"artist":   {db.ArtistsCollection, "artistid", "artist:", "creatorid"},
 	"farm":     {db.FarmsCollection, "farmid", "farm:", "createdBy"},
 	"crop":     {db.CropsCollection, "cropid", "crop:", "createdby"},
