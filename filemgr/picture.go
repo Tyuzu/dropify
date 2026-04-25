@@ -3,7 +3,6 @@ package filemgr
 import (
 	"context"
 	"dropify/db"
-	"dropify/globals"
 	"dropify/utils"
 	"encoding/json"
 	"errors"
@@ -64,6 +63,12 @@ var pictureFieldMap = map[string]PictureType{
 
 // --- Authorization ---
 func authorizeUserForEntity(ctx context.Context, entityType, entityID, userID string) error {
+	if entityType == "user" {
+		if entityID != userID {
+			return ErrUnauthorized
+		}
+		return nil
+	}
 	meta, ok := getEntityMeta(entityType)
 	if !ok {
 		return ErrUnsupportedEntity
@@ -126,7 +131,6 @@ func handleFileUpload(form *multipart.Form, field string, entity EntityType, pic
 
 func EditBanner(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	defer r.Body.Close()
-
 	entityTypeStr := ps.ByName("entitytype")
 	entityID := ps.ByName("entityid")
 
@@ -138,7 +142,7 @@ func EditBanner(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	}
 
 	// --- User Validation ---
-	requestingUserID, _ := r.Context().Value(globals.UserIDKey).(string)
+	requestingUserID := utils.GetUserIDFromRequest(r)
 	if requestingUserID == "" {
 		http.Error(w, "Invalid user", http.StatusUnauthorized)
 		return
