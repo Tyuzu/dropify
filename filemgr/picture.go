@@ -148,11 +148,17 @@ func EditBanner(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		return
 	}
 
+	log.Println("entityTypeStr :: ", entityTypeStr)
+	log.Println("entityID :: ", entityID)
+
 	// --- Authorization ---
 	if err := authorizeUserForEntity(r.Context(), entityTypeStr, entityID, requestingUserID); err != nil {
 		handleAuthError(w, err, entityTypeStr)
 		return
 	}
+
+	log.Println("entityTypeStrf :: ", entityTypeStr)
+	log.Println("entityIDf :: ", entityID)
 
 	// --- Extract Banner ---
 	field, fileName, err := extractBannerData(r, entityTypeStr)

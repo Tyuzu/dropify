@@ -43,7 +43,8 @@ func setupRouter(rateLimiter *ratelim.RateLimiter) *httprouter.Router {
 func parseAllowedOrigins(env string) []string {
 	if env == "" {
 		return []string{
-			"http://localhost:5173",
+			"https://localhost:5173",
+			"https://192.168.234.236:5173",
 			"https://indium.netlify.app",
 		}
 	}
@@ -118,7 +119,7 @@ func main() {
 	// Start server
 	go func() {
 		log.Printf("🚀 Server running on %s", port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServeTLS("cert.pem", "key.pem"); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("❌ ListenAndServe error: %v", err)
 		}
 	}()
