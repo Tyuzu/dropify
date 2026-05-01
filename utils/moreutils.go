@@ -1,30 +1,24 @@
 package utils
 
 import (
-	"context"
+	"dropify/globals"
+	"dropify/models"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
-	"mime/multipart"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-
-	"dropify/globals"
-	"dropify/middleware"
 )
 
-// --- Parsing Helpers ---
+// ----------------------
+// Parsing Helpers
+// ----------------------
 
 func ParseFloat(s string) float64 {
 	val, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
@@ -44,47 +38,6 @@ func ParseDate(s string) *time.Time {
 	return &t
 }
 
-// --- File Upload Helpers ---
-
-func SaveUploadedImage(file multipart.File, header *multipart.FileHeader) (string, error) {
-	ext := filepath.Ext(header.Filename)
-	filename := fmt.Sprintf("%d%s", time.Now().UnixNano(), ext)
-	dstPath := filepath.Join("static", "uploads", "crops", filename)
-
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0700); err != nil {
-		return "", err
-	}
-	out, err := os.Create(dstPath)
-	if err != nil {
-		return "", err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, file)
-	return "/uploads/crops/" + filename, err
-}
-
-// --- MimeType and UUID ---
-
-func GuessMimeType(filename string) string {
-	ext := strings.ToLower(filepath.Ext(filename))
-	switch ext {
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".png":
-		return "image/png"
-	case ".gif":
-		return "image/gif"
-	case ".mp4":
-		return "video/mp4"
-	case ".mov":
-		return "video/quicktime"
-	case ".webm":
-		return "video/webm"
-	default:
-		return "application/octet-stream"
-	}
-}
-
 func GetUUID() string {
 	return uuid.New().String()
 }
@@ -93,21 +46,9 @@ func SanitizeText(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// --- MongoDB Helpers ---
-
-func FindAndDecode[T any](ctx context.Context, col *mongo.Collection, filter interface{}, opts ...*options.FindOptions) ([]T, error) {
-	cursor, err := col.Find(ctx, filter, opts...)
-	if err != nil {
-		return nil, err
-	}
-	defer cursor.Close(ctx)
-
-	var results []T
-	if err := cursor.All(ctx, &results); err != nil {
-		return nil, err
-	}
-	return results, nil
-}
+// ----------------------
+// Pagination / Query Helpers
+// ----------------------
 
 type QueryOptions struct {
 	Page      int
@@ -120,14 +61,14 @@ type QueryOptions struct {
 func ParseQueryOptions(r *http.Request) QueryOptions {
 	q := r.URL.Query()
 
-	page, _ := strconv.Atoi(q.Get("page"))
-	if page < 1 {
-		page = 1
+	page := 1
+	if p, err := strconv.Atoi(q.Get("page")); err == nil && p > 0 {
+		page = p
 	}
 
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit < 1 {
-		limit = 10
+	limit := 10
+	if l, err := strconv.Atoi(q.Get("limit")); err == nil && l > 0 {
+		limit = l
 	}
 
 	var published *bool
@@ -149,7 +90,9 @@ func ContainsIgnoreCase(str, substr string) bool {
 	return strings.Contains(strings.ToLower(str), strings.ToLower(substr))
 }
 
-// --- HTTP JSON Helpers ---
+// ----------------------
+// HTTP JSON Helpers
+// ----------------------
 
 func RespondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -170,41 +113,91 @@ func ToJSON(v interface{}) []byte {
 	return data
 }
 
-// --- Sorting and Filtering ---
+// ----------------------
+// Sorting / Filtering Helpers
+// ----------------------
 
-// RegexFilter creates a case-insensitive regex filter for MongoDB queries.
-func RegexFilter(field, value string) bson.M {
+// RegexFilter creates a case-insensitive regex filter compatible with db.Database
+func RegexFilter(field, value string) map[string]any {
 	if value == "" {
-		return bson.M{}
+		return map[string]any{}
 	}
-	return bson.M{field: bson.M{"$regex": regexp.QuoteMeta(value), "$options": "i"}}
+	return map[string]any{
+		field: map[string]any{
+			"$regex":   regexp.QuoteMeta(value),
+			"$options": "i",
+		},
+	}
 }
 
-// ParseSort returns a bson.D sort specifier based on a query param and mapping.
-func ParseSort(param string, defaultSort bson.D, sortMap map[string]bson.D) bson.D {
-	if sort, ok := sortMap[param]; ok {
-		return sort
+// ParseSort returns a sort map usable in db.FindManyOptions
+func ParseSort(
+	param string,
+	defaultSort bson.D,
+	sortMap map[string]bson.D,
+) bson.D {
+
+	if s, ok := sortMap[param]; ok {
+		return s
 	}
+
 	return defaultSort
 }
 
-// ParsePagination extracts skip and limit values from the HTTP request with default and max limits.
-func ParsePagination(r *http.Request, defaultLimit, maxLimit int64) (skip, limit int64) {
-	page, _ := strconv.ParseInt(r.URL.Query().Get("page"), 10, 64)
-	limit, _ = strconv.ParseInt(r.URL.Query().Get("limit"), 10, 64)
+// ParsePagination extracts skip and limit values safely
+func ParsePagination(r *http.Request, defaultLimit, maxLimit int) (skip, limit int) {
+	page := 1
+	limit = defaultLimit
 
-	if page < 1 {
-		page = 1
+	if v := r.URL.Query().Get("page"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			page = p
+		}
 	}
-	if limit <= 0 || limit > maxLimit {
-		limit = defaultLimit
+
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if l, err := strconv.Atoi(v); err == nil && l > 0 && l <= maxLimit {
+			limit = l
+		}
 	}
 
 	skip = (page - 1) * limit
 	return
 }
 
-// --- User Context Helpers ---
+// ----------------------
+// JWT Helpers
+// ----------------------
+
+func ExtractBearerToken(header string) string {
+	if len(header) > 7 && strings.HasPrefix(header, "Bearer ") {
+		return header[7:]
+	}
+	return ""
+}
+
+func ParseToken(tokenString string) (*models.Claims, error) {
+	claims := &models.Claims{}
+	_, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (any, error) {
+		return globals.JwtSecret, nil
+	})
+	if err != nil || claims.UserID == "" {
+		return nil, fmt.Errorf("unauthorized: %w", err)
+	}
+	return claims, nil
+}
+
+func ValidateJWT(tokenString string) (*models.Claims, error) {
+	tokenString = ExtractBearerToken(tokenString)
+	if tokenString == "" {
+		return nil, fmt.Errorf("invalid token")
+	}
+	return ParseToken(tokenString)
+}
+
+// ----------------------
+// User Context Helpers
+// ----------------------
 
 func GetUserIDFromRequest(r *http.Request) string {
 	ctx := r.Context()
@@ -212,13 +205,12 @@ func GetUserIDFromRequest(r *http.Request) string {
 	if !ok || userID == "" {
 		return ""
 	}
-	log.Println("-----|-------", userID, "---------|-------")
 	return userID
 }
 
 func GetUsernameFromRequest(r *http.Request) string {
 	tokenString := r.Header.Get("Authorization")
-	claims, err := middleware.ValidateJWT(tokenString)
+	claims, err := ValidateJWT(tokenString)
 	if err != nil {
 		return ""
 	}
