@@ -9,6 +9,7 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,9 +24,16 @@ import (
 	"github.com/julienschmidt/httprouter"
 )
 
-const maxUploadBytes = 200 << 20 // 200MB
+const (
+	maxUploadBytes = 200 << 20 // request cap (200MB)
+	maxFileSize    = 50 << 20  // per file cap (50MB)
 
-// ---------------- Allowed Types ----------------
+	baseUploadPath = "./static/uploads"
+
+	maxImagePixels = 25_000_000
+	maxWidth       = 8000
+	maxHeight      = 8000
+)
 
 var allowedMimeTypes = map[string]bool{
 	"image/jpeg": true,
@@ -41,33 +49,6 @@ var allowedMimeTypes = map[string]bool{
 var allowedExtensions = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true,
 	".mp3": true, ".wav": true, ".ogg": true,
-}
-
-// ---------------- Folder Mapping ----------------
-
-func resolveFolder(key string) string {
-	switch key {
-	case "banner":
-		return "banner"
-	case "photo":
-		return "photo"
-	case "poster":
-		return "poster"
-	case "thumb":
-		return "thumb"
-	case "image":
-		return "images"
-	case "audio":
-		return "audio"
-	case "video":
-		return "videos"
-	case "document":
-		return "docs"
-	case "gallery":
-		return "gallery"
-	default:
-		return "misc"
-	}
 }
 
 // ---------------- Handler ----------------
@@ -92,21 +73,21 @@ func FiledropHandler(w http.ResponseWriter, r *http.Request, _ httprouter.Params
 		entityType = "misc"
 	}
 
-	// ---------------- Remote URL ingestion ----------------
-	remoteURL := strings.TrimSpace(r.FormValue("remoteUrl"))
-	remoteKey := strings.ToLower(strings.TrimSpace(r.FormValue("remoteKey")))
+	// Remote upload
+	if remoteURL := strings.TrimSpace(r.FormValue("remoteUrl")); remoteURL != "" {
+		key := strings.ToLower(strings.TrimSpace(r.FormValue("remoteKey")))
 
-	if remoteURL != "" {
-		att, err := handleRemoteUpload(remoteURL, remoteKey, entityType, entityId)
+		att, err := handleRemoteUpload(remoteURL, key, entityType, entityId)
 		if err != nil {
 			utils.RespondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+
 		utils.RespondWithJSON(w, http.StatusOK, []Attachment{att})
 		return
 	}
 
-	// ---------------- Normal Upload ----------------
+	// Local upload
 	if r.MultipartForm == nil || len(r.MultipartForm.File) == 0 {
 		utils.RespondWithError(w, http.StatusBadRequest, "no files provided")
 		return
@@ -134,6 +115,57 @@ type Attachment struct {
 	EntityType  string `json:"entityType,omitempty"`
 	EntityID    string `json:"entityId,omitempty"`
 	Resolutions []int  `json:"resolutions,omitempty"`
+}
+
+// ---------------- Core Save ----------------
+
+func saveFile(reader io.Reader, mimeType, key, entityType, entityId string) (Attachment, error) {
+	limited := &io.LimitedReader{
+		R: reader,
+		N: maxFileSize + 1,
+	}
+
+	ext := ".bin"
+	if exts, _ := mime.ExtensionsByType(mimeType); len(exts) > 0 {
+		ext = exts[0]
+	}
+
+	filename := fmt.Sprintf("%d%s", time.Now().UnixNano(), ext)
+	folder := resolveFolder(key)
+
+	saveDir := filepath.Join(baseUploadPath, entityType, folder)
+	if err := os.MkdirAll(saveDir, 0755); err != nil {
+		return Attachment{}, err
+	}
+
+	savePath := filepath.Join(saveDir, filename)
+
+	out, err := os.Create(savePath)
+	if err != nil {
+		return Attachment{}, err
+	}
+	defer out.Close()
+
+	written, err := io.Copy(out, limited)
+	if err != nil {
+		return Attachment{}, err
+	}
+
+	if written > maxFileSize {
+		os.Remove(savePath)
+		return Attachment{}, fmt.Errorf("file too large")
+	}
+
+	res := safeDetectResolution(savePath, mimeType)
+
+	return Attachment{
+		Filename:    filename,
+		Extn:        ext,
+		Key:         key,
+		EntityType:  entityType,
+		EntityID:    entityId,
+		Resolutions: res,
+	}, nil
 }
 
 // ---------------- Local Upload ----------------
@@ -167,56 +199,27 @@ func handleRegularUpload(fh *multipart.FileHeader, key, entityType, entityId str
 	n, _ := file.Read(head)
 	head = head[:n]
 
-	mimeType := http.DetectContentType(head)
-
 	ext := strings.ToLower(filepath.Ext(fh.Filename))
-	if ext == "" {
-		if exts, _ := mime.ExtensionsByType(mimeType); len(exts) > 0 {
-			ext = exts[0]
-		} else {
-			ext = ".bin"
-		}
-	}
 
-	if !allowedMimeTypes[mimeType] || !allowedExtensions[ext] {
-		return Attachment{}, fmt.Errorf("file type not allowed")
-	}
-
-	file.Seek(0, io.SeekStart)
-
-	filename := fmt.Sprintf("%d%s", time.Now().UnixNano(), ext)
-	folder := resolveFolder(key)
-
-	saveDir := filepath.Join("./uploads", entityType, folder)
-	os.MkdirAll(saveDir, 0755)
-
-	savePath := filepath.Join(saveDir, filename)
-
-	out, err := os.Create(savePath)
+	mimeType, err := validateFile(head, ext)
 	if err != nil {
 		return Attachment{}, err
 	}
-	defer out.Close()
 
-	if _, err := io.Copy(out, file); err != nil {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return Attachment{}, fmt.Errorf("file seek failed")
+	}
+
+	att, err := saveFile(file, mimeType, key, entityType, entityId)
+	if err != nil {
 		return Attachment{}, err
 	}
 
-	res := detectResolution(savePath, mimeType)
-
-	log.Printf("uploaded local: %s", filename)
-
-	return Attachment{
-		Filename:    filename,
-		Extn:        ext,
-		Key:         key,
-		EntityType:  entityType,
-		EntityID:    entityId,
-		Resolutions: res,
-	}, nil
+	log.Printf("uploaded local: %s", att.Filename)
+	return att, nil
 }
 
-// ---------------- Remote Upload (KEY PART) ----------------
+// ---------------- Remote Upload ----------------
 
 func handleRemoteUpload(remoteURL, key, entityType, entityId string) (Attachment, error) {
 	u, err := url.Parse(remoteURL)
@@ -228,7 +231,12 @@ func handleRemoteUpload(remoteURL, key, entityType, entityId string) (Attachment
 		return Attachment{}, fmt.Errorf("blocked host")
 	}
 
-	client := &http.Client{Timeout: 12 * time.Second}
+	client := &http.Client{
+		Timeout: 12 * time.Second,
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: 5 * time.Second,
+		},
+	}
 
 	resp, err := client.Get(remoteURL)
 	if err != nil {
@@ -244,54 +252,56 @@ func handleRemoteUpload(remoteURL, key, entityType, entityId string) (Attachment
 	n, _ := resp.Body.Read(head)
 	head = head[:n]
 
-	mimeType := http.DetectContentType(head)
-
-	if !allowedMimeTypes[mimeType] {
-		return Attachment{}, fmt.Errorf("unsupported file type")
-	}
-
-	ext := ".jpg"
-	if exts, _ := mime.ExtensionsByType(mimeType); len(exts) > 0 {
-		ext = exts[0]
-	}
-
-	filename := fmt.Sprintf("%d%s", time.Now().UnixNano(), ext)
-	folder := resolveFolder(key)
-
-	saveDir := filepath.Join("./uploads", entityType, folder)
-	os.MkdirAll(saveDir, 0755)
-
-	savePath := filepath.Join(saveDir, filename)
-
-	out, err := os.Create(savePath)
+	mimeType, err := validateFile(head, "")
 	if err != nil {
 		return Attachment{}, err
 	}
-	defer out.Close()
 
 	reader := io.MultiReader(bytes.NewReader(head), resp.Body)
 
-	if _, err := io.Copy(out, reader); err != nil {
+	att, err := saveFile(reader, mimeType, key, entityType, entityId)
+	if err != nil {
 		return Attachment{}, err
 	}
 
-	res := detectResolution(savePath, mimeType)
-
-	log.Printf("uploaded remote: %s", filename)
-
-	return Attachment{
-		Filename:    filename,
-		Extn:        ext,
-		Key:         key,
-		EntityType:  entityType,
-		EntityID:    entityId,
-		Resolutions: res,
-	}, nil
+	log.Printf("uploaded remote: %s", att.Filename)
+	return att, nil
 }
 
-// ---------------- Helpers ----------------
+// ---------------- Validation ----------------
 
-func detectResolution(path, mimeType string) []int {
+func validateFile(head []byte, ext string) (string, error) {
+	mimeType := http.DetectContentType(head)
+
+	if !allowedMimeTypes[mimeType] {
+		return "", fmt.Errorf("invalid mime type")
+	}
+
+	if ext != "" && !allowedExtensions[ext] {
+		return "", fmt.Errorf("invalid extension")
+	}
+
+	if ext != "" {
+		if exts, _ := mime.ExtensionsByType(mimeType); len(exts) > 0 {
+			valid := false
+			for _, e := range exts {
+				if e == ext {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				return "", fmt.Errorf("mime/extension mismatch")
+			}
+		}
+	}
+
+	return mimeType, nil
+}
+
+// ---------------- Image Safety ----------------
+
+func safeDetectResolution(path, mimeType string) []int {
 	if !strings.HasPrefix(mimeType, "image/") {
 		return nil
 	}
@@ -307,7 +317,46 @@ func detectResolution(path, mimeType string) []int {
 		return nil
 	}
 
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return nil
+	}
+
+	if cfg.Width > maxWidth || cfg.Height > maxHeight {
+		return nil
+	}
+
+	if cfg.Width*cfg.Height > maxImagePixels {
+		return nil
+	}
+
 	return []int{cfg.Width, cfg.Height}
+}
+
+// ---------------- Helpers ----------------
+
+func resolveFolder(key string) string {
+	switch key {
+	case "banner":
+		return "banner"
+	case "photo":
+		return "photo"
+	case "poster":
+		return "poster"
+	case "thumb":
+		return "thumb"
+	case "image":
+		return "images"
+	case "audio":
+		return "audio"
+	case "video":
+		return "videos"
+	case "document":
+		return "docs"
+	case "gallery":
+		return "gallery"
+	default:
+		return "misc"
+	}
 }
 
 func sanitize(s string) string {
@@ -318,15 +367,24 @@ func sanitize(s string) string {
 }
 
 func isPrivateHost(host string) bool {
-	host = strings.ToLower(host)
-
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	ip := net.ParseIP(host)
+	if ip == nil {
 		return true
 	}
-	if strings.HasPrefix(host, "10.") ||
-		strings.HasPrefix(host, "192.168.") ||
-		strings.HasPrefix(host, "172.") {
-		return true
+
+	privateRanges := []string{
+		"127.0.0.0/8",
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"::1/128",
+	}
+
+	for _, cidr := range privateRanges {
+		_, block, _ := net.ParseCIDR(cidr)
+		if block.Contains(ip) {
+			return true
+		}
 	}
 
 	return false
